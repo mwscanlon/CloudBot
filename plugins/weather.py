@@ -5,12 +5,7 @@ from cloudbot import hook
 from cloudbot.util import web, database
 
 
-class APIError(Exception):
-    pass
-
-
-# Define database table
-
+# Define a database table to store the last-searched location
 table = Table(
     "weather",
     database.metadata,
@@ -19,34 +14,52 @@ table = Table(
     PrimaryKeyConstraint('nick')
 )
 
+location_cache = {}
+
 # Define some constants
 google_base = 'https://maps.googleapis.com/maps/api/'
 geocode_api = google_base + 'geocode/json'
-
-wunder_api = "http://api.wunderground.com/api/{}/forecast/geolookup/conditions/q/{}.json"
+wunder_api = "http://api.wunderground.com/api/{}/forecast/lang:{}/geolookup/conditions/q/{}.json"
 
 # Change this to a ccTLD code (eg. uk, nz) to make results more targeted towards that specific country.
 # <https://developers.google.com/maps/documentation/geocoding/#RegionCodes>
 bias = None
 
 
-def check_status(status):
-    """
-    A little helper function that checks an API error code and returns a nice message.
-    Returns None if no errors found
-    """
-    if status == 'REQUEST_DENIED':
-        return 'The geocode API is off in the Google Developers Console.'
-    elif status == 'ZERO_RESULTS':
-        return 'No results found.'
-    elif status == 'OVER_QUERY_LIMIT':
-        return 'The geocode API quota has run out.'
-    elif status == 'UNKNOWN_ERROR':
-        return 'Unknown Error.'
-    elif status == 'INVALID_REQUEST':
-        return 'Invalid Request.'
-    elif status == 'OK':
-        return None
+class GeocodeAPIError(Exception):
+    """Raised when the geocode api returns an error message.
+    This helps error messages optionally be returned *en francais*."""
+    def __init__(self, status):
+        super()
+        self._status = status
+
+    def __str__(self):
+        if self._status == 'REQUEST_DENIED':
+            return 'The geocode API is off in the Google Developers Console.'
+        elif self._status == 'ZERO_RESULTS':
+            return 'No results found.'
+        elif self._status == 'OVER_QUERY_LIMIT':
+            return 'The geocode API quota has run out.'
+        elif self._status == 'UNKNOWN_ERROR':
+            return 'Unknown Error.'
+        elif self._status == 'INVALID_REQUEST':
+            return 'Invalid Request.'
+        else:
+            return repr(self._status)
+
+    def en_francais(self):
+        if self._status == 'REQUEST_DENIED':
+            return "L'API de géocodage est désactivée dans la console des développeurs Google."
+        elif self._status == 'ZERO_RESULTS':
+            return "Aucun resultat n'a été trouvé."
+        elif self._status == 'OVER_QUERY_LIMIT':
+            return "Le quota de API de géocodage est épuisé."
+        elif self._status == 'UNKNOWN_ERROR':
+            return 'Quelque chose a mal tourné.'
+        elif self._status == 'INVALID_REQUEST':
+            return 'Il y a eu une demande invalide.'
+        else:
+            return 'La France a été trahie! {!r}'.format(self._status)
 
 
 def find_location(location):
@@ -63,61 +76,83 @@ def find_location(location):
     request.raise_for_status()
 
     json = request.json()
-    error = check_status(json['status'])
-    if error:
-        raise APIError(error)
+
+    if json['status'] != 'OK':
+        raise GeocodeAPIError(json['status'])
 
     return json['results'][0]['geometry']['location']
 
 
 def load_cache(db):
-    global location_cache
-    location_cache = []
+    """
+    :type db: sqlalchemy.orm.Session
+    """
     for row in db.execute(table.select()):
         nick = row["nick"]
         location = row["loc"]
-        location_cache.append((nick, location))
+        location_cache[nick] = location
 
 
-def add_location(nick, location, db):
-    test = dict(location_cache)
-    location = str(location)
-    if nick.lower() in test:
-        db.execute(table.update().values(loc=location.lower()).where(table.c.nick == nick.lower()))
-        db.commit()
-        load_cache(db)
+def set_location(nick, location, db):
+    """
+    :type nick: str
+    :type location: str
+    :type db: sqlalchemy.orm.Session
+    """
+    nick, location = nick.lower(), location.lower()
+    if nick in location_cache:
+        statement = table.update().values(loc=location).where(table.c.nick == nick)
     else:
-        db.execute(table.insert().values(nick=nick.lower(), loc=location.lower()))
-        db.commit()
-        load_cache(db)
+        statement = table.insert().values(nick=nick, loc=location)
+    db.execute(statement)
+    db.commit()
+    load_cache(db)
+
+
+def get_location(nick):
+    """looks in location_cache for a saved location"""
+    return location_cache.get(nick.lower(), None)
 
 
 @hook.on_start
 def on_start(bot, db):
-    """ Loads API keys """
+    """ Loads API keys
+    :type bot: cloudbot.bot.Cloudbot
+    :type db: sqlalchemy.orm.Session
+    """
     global dev_key, wunder_key
     dev_key = bot.config.get("api_keys", {}).get("google_dev_key", None)
     wunder_key = bot.config.get("api_keys", {}).get("wunderground", None)
     load_cache(db)
 
 
-def get_location(nick):
-    """looks in location_cache for a saved location"""
-    location = [row[1] for row in location_cache if nick.lower() == row[0]]
-    if not location:
-        return
-    else:
-        location = location[0]
-    return location
+class APIKeyMissing(Exception):
+    """Raised when an API key is missing.
+    This helps error messages optionally be returned *en francais*."""
+    def __init__(self, name):
+        super()
+        self._name = name
+
+    def __str__(self):
+        return 'This command requires a {} API key.'.format(self._name)
+
+    def en_francais(self):
+        return 'Cette commande nécessite une clé API {}.'.format(self._name)
 
 
-@hook.command("weather", "we", autohelp=False)
-def weather(text, reply, db, nick, notice_doc):
-    """<location> - Gets weather data for <location>."""
+def get_weather_data(text, db, nick, notice_doc, language='EN'):
+    """Get weather data from Weather Underground.
+    :type text: str
+    :type db: sqlalchemy.orm.Session
+    :type nick: str
+    :type notice_doc: Callable
+    :param str language: two-letter language code
+    (see https://www.wunderground.com/weather/api/d/docs?d=language-support)
+    """
     if not wunder_key:
-        return "This command requires a Weather Underground API key."
+        raise APIKeyMissing('Weather Underground')
     if not dev_key:
-        return "This command requires a Google Developers Console API key."
+        raise APIKeyMissing('Google Developers Console')
 
     # If no input try the db
     if not text:
@@ -129,15 +164,11 @@ def weather(text, reply, db, nick, notice_doc):
         location = text
 
     # use find_location to get location data from the user input
-    try:
-        location_data = find_location(location)
-    except APIError as e:
-        reply(str(e))
-        raise
+    location_data = find_location(location)
 
     formatted_location = "{lat},{lng}".format(**location_data)
 
-    url = wunder_api.format(wunder_key, formatted_location)
+    url = wunder_api.format(wunder_key, language, formatted_location)
     request = requests.get(url)
     request.raise_for_status()
 
@@ -149,7 +180,7 @@ def weather(text, reply, db, nick, notice_doc):
 
     forecast = response["forecast"]["simpleforecast"]["forecastday"]
     if not forecast:
-        return "Unable to retrieve forecast data."
+        return 'Unable to retrieve forecast data.'
 
     forecast_today = forecast[0]
     forecast_tomorrow = forecast[1]
@@ -192,11 +223,62 @@ def weather(text, reply, db, nick, notice_doc):
 
     weather_data['url'] = web.try_shorten(url)
 
-    reply("{place} - \x02Current:\x02 {conditions}, {temp_f}F/{temp_c}C, {humidity}, "
-          "Wind: {wind_mph}MPH/{wind_kph}KPH {wind_direction}, \x02Today:\x02 {today_conditions}, "
-          "High: {today_high_f}F/{today_high_c}C, Low: {today_low_f}F/{today_low_c}C. "
-          "\x02Tomorrow:\x02 {tomorrow_conditions}, High: {tomorrow_high_f}F/{tomorrow_high_c}C, "
+    if text:
+        set_location(nick, location, db)
+
+    return weather_data
+
+
+@hook.command("weather", "we", autohelp=False)
+def weather(text, reply, db, nick, notice_doc):
+    """<location> - Gets weather data for <location>.
+    :type text: str
+    :type reply: Callable
+    :type db: sqlalchemy.orm.Session
+    :type nick: str
+    :type notice_doc: Callable
+    """
+    try:
+        weather_data = get_weather_data(text, db, nick, notice_doc)
+    except (APIKeyMissing, GeocodeAPIError) as e:
+        return str(e)
+    if not isinstance(weather_data, dict):
+        return weather_data
+    reply("{place} - \x02Current:\x02 {conditions}, "
+          "{temp_f}F/{temp_c}C, {humidity}, "
+          "Wind: {wind_mph}MPH/{wind_kph}KPH {wind_direction}, "
+          "\x02Today:\x02 {today_conditions}, "
+          "High: {today_high_f}F/{today_high_c}C, "
+          "Low: {today_low_f}F/{today_low_c}C. "
+          "\x02Tomorrow:\x02 {tomorrow_conditions}, "
+          "High: {tomorrow_high_f}F/{tomorrow_high_c}C, "
           "Low: {tomorrow_low_f}F/{tomorrow_low_c}C - {url}".format_map(weather_data))
 
-    if text:
-        add_location(nick, location, db)
+
+# 'oui' is a pun, see https://github.com/snoonetIRC/CloudBot/issues/271
+@hook.command('météo', 'meteo', 'oui', autohelp=False)
+def meteo(text, reply, db, nick, notice_doc):
+    """<lieu> - Quel temps fait-il à <lieu>?
+    :type text: str
+    :type reply: Callable
+    :type db: sqlalchemy.orm.Session
+    :type nick: str
+    :type notice_doc: Callable
+    """
+    try:
+        weather_data = get_weather_data(text, db, nick, notice_doc, language='FR')
+    except (APIKeyMissing, GeocodeAPIError) as e:
+        return e.en_francais()
+    if not isinstance(weather_data, dict):
+        if weather_data == 'Unable to retrieve forecast data.':
+            weather_data = 'Impossible de récupérer les données météorologiques.'
+        return weather_data
+    reply("{place} - \x02Actuelle:\x02 {conditions}, "
+          "{temp_f}F/{temp_c}C, {humidity}, "
+          "Vent: {wind_mph}MPH/{wind_kph}KPH {wind_direction}, "
+          "\x02Aujourd'hui:\x02 {today_conditions}, "
+          "Haute: {today_high_f}F/{today_high_c}C, "
+          "Basse: {today_low_f}F/{today_low_c}C. "
+          "\x02Demain:\x02 {tomorrow_conditions}, "
+          "Haute: {tomorrow_high_f}F/{tomorrow_high_c}C, "
+          "Basse: {tomorrow_low_f}F/{tomorrow_low_c}C - {url}".format_map(weather_data))
