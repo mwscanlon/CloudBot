@@ -36,30 +36,28 @@ class GeocodeAPIError(Exception):
     def __str__(self):
         if self._status == 'REQUEST_DENIED':
             return 'The geocode API is off in the Google Developers Console.'
-        elif self._status == 'ZERO_RESULTS':
+        if self._status == 'ZERO_RESULTS':
             return 'No results found.'
-        elif self._status == 'OVER_QUERY_LIMIT':
+        if self._status == 'OVER_QUERY_LIMIT':
             return 'The geocode API quota has run out.'
-        elif self._status == 'UNKNOWN_ERROR':
+        if self._status == 'UNKNOWN_ERROR':
             return 'Unknown Error.'
-        elif self._status == 'INVALID_REQUEST':
+        if self._status == 'INVALID_REQUEST':
             return 'Invalid Request.'
-        else:
-            return repr(self._status)
+        return repr(self._status)
 
     def en_francais(self):
         if self._status == 'REQUEST_DENIED':
             return "L'API de géocodage est désactivée dans la console des développeurs Google."
-        elif self._status == 'ZERO_RESULTS':
+        if self._status == 'ZERO_RESULTS':
             return "Aucun resultat n'a été trouvé."
-        elif self._status == 'OVER_QUERY_LIMIT':
+        if self._status == 'OVER_QUERY_LIMIT':
             return "Le quota de API de géocodage est épuisé."
-        elif self._status == 'UNKNOWN_ERROR':
+        if self._status == 'UNKNOWN_ERROR':
             return 'Quelque chose a mal tourné.'
-        elif self._status == 'INVALID_REQUEST':
+        if self._status == 'INVALID_REQUEST':
             return 'Il y a eu une demande invalide.'
-        else:
-            return 'La France a été trahie! {!r}'.format(self._status)
+        return 'La France a été trahie! {!r}'.format(self._status)
 
 
 def find_location(location):
